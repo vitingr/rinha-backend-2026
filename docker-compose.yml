@@ -3,12 +3,10 @@ networks:
     driver: bridge
 
 services:
-
-  # Load balancer
   nginx:
     image: nginx:1.25-alpine
     volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
       - ./sockets:/tmp/sockets
     ports:
       - "9999:9999"
@@ -27,9 +25,7 @@ services:
     restart: unless-stopped
 
   api1:
-    build:
-      context: ./api
-      dockerfile: Dockerfile
+    image: vitingr/rinha-backend-2026:latest
     environment:
       PORT: "/tmp/sockets/api1.sock"
       REFERENCES_PATH: "/app/resources/references.json.gz"
@@ -54,9 +50,7 @@ services:
     restart: unless-stopped
 
   api2:
-    build:
-      context: ./api
-      dockerfile: Dockerfile
+    image: vitingr/rinha-backend-2026:latest
     environment:
       PORT: "/tmp/sockets/api2.sock"
       REFERENCES_PATH: "/app/resources/references.json.gz"
