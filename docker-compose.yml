@@ -3,8 +3,6 @@ networks:
     driver: bridge
 
 services:
-
-  # Load balancer
   nginx:
     image: nginx:1.25-alpine
     volumes:
