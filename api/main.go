@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"log"
 	"math"
-	"net/http"
+	"net"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
+	"github.com/valyala/fasthttp"
 )
 
 const (
@@ -41,7 +43,8 @@ var mccRisk = map[string]float32{
 
 // Dataset
 // Layout: refVecs[i*dims : i*dims+dims] = 14-dim float32 vector i
-//         refFraud[i] == 1 means fraud
+//
+//	refFraud[i] == 1 means fraud
 //
 // 100k * 14 * 4 = 5.6 MB (vectors) + 100 KB (labels) = ~5.7 MB total
 // Fits entirely in L3 cache → after warmup each KNN is pure cache hits
@@ -52,6 +55,12 @@ var (
 
 	readyOnce sync.Once
 	readyCh   = make(chan struct{})
+
+	vecPool = sync.Pool{
+		New: func() interface{} {
+			return new([dims]float32)
+		},
+	}
 )
 
 // Precomputed responses — all 6 possible outcomes, built once at startup.
@@ -69,19 +78,6 @@ func buildResponses() {
 	}
 }
 
-// KNN — brute-force linear scan with a fixed-size max-heap
-//
-// Benchmark results (Intel Xeon 2.8GHz, 2 hardware threads, 100k vectors):
-//   1 goroutine: ~1.07 ms/op, 0 allocs
-//   2 goroutines: ~1.25 ms/op, 3 allocs  ← goroutine overhead > gain
-//   4 goroutines: ~1.37 ms/op, 5 allocs
-//
-// Conclusion: stay single-threaded. The 5.6 MB dataset warms into L3 and
-// sequential scan is the fastest memory access pattern. No sync overhead.
-
-// heap5 is a max-heap capped at k=5 elements. Lives on the goroutine stack
-// (stack-allocated, zero escape to heap) because it never crosses function
-// boundaries by pointer to the outside.
 type heap5 struct {
 	dist [kNeighbors]float32
 	idx  [kNeighbors]int32
@@ -177,9 +173,20 @@ func knn(query *[dims]float32) int {
 	n := refN
 	stride := dims
 
-	for i := 0; i < n; i++ {
-		d := euclidSq(query, vecs, i*stride)
-		h.push(d, int32(i))
+	// Loop unrolling: processa 4 vetores por iteração para melhor uso de cache/pipeline
+	i := 0
+	for ; i+3 < n; i += 4 {
+		d0 := euclidSq(query, vecs, i*stride)
+		d1 := euclidSq(query, vecs, (i+1)*stride)
+		d2 := euclidSq(query, vecs, (i+2)*stride)
+		d3 := euclidSq(query, vecs, (i+3)*stride)
+		h.push(d0, int32(i))
+		h.push(d1, int32(i+1))
+		h.push(d2, int32(i+2))
+		h.push(d3, int32(i+3))
+	}
+	for ; i < n; i++ {
+		h.push(euclidSq(query, vecs, i*stride), int32(i))
 	}
 	return h.countFraud()
 }
@@ -365,41 +372,41 @@ type TxRequest struct {
 	LastTransaction *LastTransaction `json:"last_transaction"`
 }
 
-// HTTP handlers
-func handleFraudScore(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
-		return
+func handleFraudScore(ctx *fasthttp.RequestCtx) {
+	if !ctx.IsPost() {
+			ctx.SetStatusCode(fasthttp.StatusMethodNotAllowed)
+			ctx.SetBodyString(`{"error":"method not allowed"}`)
+			return
 	}
 
 	var req TxRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"bad request"}`, http.StatusBadRequest)
-		return
+	if err := json.Unmarshal(ctx.PostBody(), &req); err != nil {
+			ctx.SetStatusCode(fasthttp.StatusBadRequest)
+			ctx.SetBodyString(`{"error":"bad request"}`)
+			return
 	}
 
-	var vec [dims]float32
-	vectorize(&req, &vec)
+	vec := vecPool.Get().(*[dims]float32)
+	vectorize(&req, vec)
+	fraudCount := knn(vec)
+	vecPool.Put(vec)
 
-	fraudCount := knn(&vec)
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(httpResp[fraudCount])
+	ctx.SetContentType("application/json")
+	ctx.SetStatusCode(fasthttp.StatusOK)
+	ctx.SetBody(httpResp[fraudCount])
 }
 
-func handleReady(w http.ResponseWriter, r *http.Request) {
+func handleReady(ctx *fasthttp.RequestCtx) {
 	select {
 	case <-readyCh:
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"ok"}`))
+			ctx.SetStatusCode(fasthttp.StatusOK)
+			ctx.SetBodyString(`{"status":"ok"}`)
 	default:
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = w.Write([]byte(`{"status":"loading"}`))
+			ctx.SetStatusCode(fasthttp.StatusServiceUnavailable)
+			ctx.SetBodyString(`{"status":"loading"}`)
 	}
 }
 
-// Dataset loading
 type refEntry struct {
 	Vector [dims]float64 `json:"vector"`
 	Label  string        `json:"label"`
@@ -443,7 +450,6 @@ func loadDataset(path string) error {
 		}
 	}
 
-	// Pre-touch all pages → no page-fault latency on first requests
 	var chk float32
 	for _, v := range vecs {
 		chk += v
@@ -458,7 +464,7 @@ func loadDataset(path string) error {
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "health" {
-    os.Exit(0)
+		os.Exit(0)
 	}
 
 	buildResponses()
@@ -474,29 +480,44 @@ func main() {
 		log.Fatalf("Failed to load dataset: %v", err)
 	}
 
-	// Signal /ready
+
 	readyOnce.Do(func() { close(readyCh) })
 
 	port := os.Getenv("PORT")
-	if port == "" {
-		port = "9999"
-	}
+    if port == "" {
+        port = "9999"
+    }
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/ready", handleReady)
-	mux.HandleFunc("/fraud-score", handleFraudScore)
+    requestHandler := func(ctx *fasthttp.RequestCtx) {
+        switch string(ctx.Path()) {
+        case "/fraud-score":
+            handleFraudScore(ctx)
+        case "/ready":
+            handleReady(ctx)
+        default:
+            ctx.Error("not found", fasthttp.StatusNotFound)
+        }
+    }
 
-	srv := &http.Server{
-		Addr:              ":" + port,
-		Handler:           mux,
-		ReadTimeout:       5 * time.Second,
-		WriteTimeout:      5 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		ReadHeaderTimeout: 1 * time.Second,
-	}
+    s := &fasthttp.Server{
+        Handler:               requestHandler,
+        ReadTimeout:           2 * time.Second,
+        WriteTimeout:          2 * time.Second,
+        IdleTimeout:           60 * time.Second,
+        NoDefaultServerHeader: true, // Save a few bytes/cpu cycles
+    }
 
-	log.Printf("Listening on :%s — ready", port)
-	if err := srv.ListenAndServe(); err != nil {
-		log.Fatal(err)
-	}
+    if strings.HasSuffix(port, ".sock") {
+        os.Remove(port)
+        ln, err := net.Listen("unix", port)
+        if err != nil {
+            log.Fatalf("error in listen: %s", err)
+        }
+        os.Chmod(port, 0777)
+        log.Printf("Listening on socket: %s", port)
+        log.Fatal(s.Serve(ln))
+    } else {
+        log.Printf("Listening on TCP :%s", port)
+        log.Fatal(s.ListenAndServe(":" + port))
+    }
 }

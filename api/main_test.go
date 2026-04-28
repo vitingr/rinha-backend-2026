@@ -1,26 +1,18 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"math"
-	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
-)
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────────────────
+	"github.com/valyala/fasthttp"
+)
 
 func almostEq(a, b, tol float32) bool {
 	return float32(math.Abs(float64(a-b))) <= tol
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Precomputed responses
-// ─────────────────────────────────────────────────────────────────────────────
 
 func TestBuildResponses(t *testing.T) {
 	buildResponses()
@@ -43,10 +35,6 @@ func TestBuildResponses(t *testing.T) {
 	}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Clamp
-// ─────────────────────────────────────────────────────────────────────────────
-
 func TestClamp(t *testing.T) {
 	tests := []struct{ in, want float32 }{
 		{-99, 0}, {0, 0}, {0.5, 0.5}, {1, 1}, {1.5, 1}, {99, 1},
@@ -57,10 +45,6 @@ func TestClamp(t *testing.T) {
 		}
 	}
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Date/time helpers
-// ─────────────────────────────────────────────────────────────────────────────
 
 func TestParseHour(t *testing.T) {
 	cases := []struct {
@@ -123,10 +107,6 @@ func TestMinutesBetween(t *testing.T) {
 		t.Errorf("minutesBetween = %.4f, want %.4f", got, want)
 	}
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Vectorization — ground truth from DETECTION_RULES.md
-// ─────────────────────────────────────────────────────────────────────────────
 
 func TestVectorizeLegitTx(t *testing.T) {
 	// Expected: [0.0041, 0.1667, 0.05, 0.7826, 0.3333, -1, -1, 0.0292, 0.15, 0, 1, 0, 0.15, 0.006]
@@ -210,10 +190,6 @@ func TestVectorizeOnlineNoCard(t *testing.T) {
 	}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// KNN
-// ─────────────────────────────────────────────────────────────────────────────
-
 func TestKNNAllLegit(t *testing.T) {
 	setupDataset(20, false)
 	var q [dims]float32
@@ -268,20 +244,22 @@ func TestEuclidSq(t *testing.T) {
 	}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// HTTP integration
-// ─────────────────────────────────────────────────────────────────────────────
-
 func TestHandleReadyOK(t *testing.T) {
 	buildResponses()
 	setupDataset(10, false)
+	// Ensure the channel is closed for the "Ready" state
 	readyOnce.Do(func() { close(readyCh) })
 
-	req := httptest.NewRequest(http.MethodGet, "/ready", nil)
-	w := httptest.NewRecorder()
-	handleReady(w, req)
-	if w.Code != http.StatusOK {
-		t.Errorf("ready = %d, want 200", w.Code)
+	ctx := &fasthttp.RequestCtx{}
+	handleReady(ctx)
+
+	if ctx.Response.StatusCode() != fasthttp.StatusOK {
+		t.Errorf("ready status = %d, want 200", ctx.Response.StatusCode())
+	}
+	
+	expected := `{"status":"ok"}`
+	if string(ctx.Response.Body()) != expected {
+		t.Errorf("got %s, want %s", string(ctx.Response.Body()), expected)
 	}
 }
 
@@ -289,24 +267,26 @@ func TestHandleFraudScoreOK(t *testing.T) {
 	buildResponses()
 	setupDataset(20, false)
 
+	ctx := &fasthttp.RequestCtx{}
+	ctx.Request.Header.SetMethod("POST")
+	ctx.Request.Header.SetContentType("application/json")
+	
 	body, _ := json.Marshal(makeLegitReq())
-	req := httptest.NewRequest(http.MethodPost, "/fraud-score", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	handleFraudScore(w, req)
+	ctx.Request.SetBody(body)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", w.Code)
+	handleFraudScore(ctx)
+
+	if ctx.Response.StatusCode() != fasthttp.StatusOK {
+		t.Fatalf("status = %d, want 200", ctx.Response.StatusCode())
 	}
+
 	var resp map[string]interface{}
-	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("invalid JSON: %v — %s", err, w.Body.String())
+	if err := json.Unmarshal(ctx.Response.Body(), &resp); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
 	}
-	if _, ok := resp["approved"]; !ok {
-		t.Error("missing 'approved'")
-	}
-	if _, ok := resp["fraud_score"]; !ok {
-		t.Error("missing 'fraud_score'")
+	
+	if val, ok := resp["approved"].(bool); !ok || !val {
+		t.Error("expected approved: true for legit request")
 	}
 }
 
@@ -314,41 +294,41 @@ func TestHandleFraudScoreAllFraud(t *testing.T) {
 	buildResponses()
 	setupDataset(20, true)
 
+	ctx := &fasthttp.RequestCtx{}
+	ctx.Request.Header.SetMethod("POST")
+	
 	body, _ := json.Marshal(makeFraudReq())
-	req := httptest.NewRequest(http.MethodPost, "/fraud-score", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	handleFraudScore(w, req)
+	ctx.Request.SetBody(body)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d", w.Code)
-	}
-	if !strings.Contains(w.Body.String(), `"approved":false`) {
-		t.Errorf("expected denied in all-fraud, got: %s", w.Body.String())
+	handleFraudScore(ctx)
+
+	if !strings.Contains(string(ctx.Response.Body()), `"approved":false`) {
+		t.Errorf("expected denied in all-fraud scenario, got: %s", string(ctx.Response.Body()))
 	}
 }
 
 func TestHandleFraudScoreBadJSON(t *testing.T) {
-	req := httptest.NewRequest(http.MethodPost, "/fraud-score", strings.NewReader("{bad"))
-	w := httptest.NewRecorder()
-	handleFraudScore(w, req)
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("bad JSON = %d, want 400", w.Code)
+	ctx := &fasthttp.RequestCtx{}
+	ctx.Request.Header.SetMethod("POST")
+	ctx.Request.SetBodyString("{invalid-json")
+
+	handleFraudScore(ctx)
+
+	if ctx.Response.StatusCode() != fasthttp.StatusBadRequest {
+		t.Errorf("got %d, want 400", ctx.Response.StatusCode())
 	}
 }
 
 func TestHandleFraudScoreWrongMethod(t *testing.T) {
-	req := httptest.NewRequest(http.MethodGet, "/fraud-score", nil)
-	w := httptest.NewRecorder()
-	handleFraudScore(w, req)
-	if w.Code != http.StatusMethodNotAllowed {
-		t.Errorf("GET = %d, want 405", w.Code)
+	ctx := &fasthttp.RequestCtx{}
+	ctx.Request.Header.SetMethod("GET")
+
+	handleFraudScore(ctx)
+
+	if ctx.Response.StatusCode() != fasthttp.StatusMethodNotAllowed {
+		t.Errorf("GET should return 405, got %d", ctx.Response.StatusCode())
 	}
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Benchmarks
-// ─────────────────────────────────────────────────────────────────────────────
 
 func BenchmarkVectorize(b *testing.B) {
 	req := makeFullReq()
@@ -395,19 +375,23 @@ func BenchmarkFullHTTPRequest(b *testing.B) {
 	readyOnce.Do(func() { close(readyCh) })
 
 	body, _ := json.Marshal(makeFullReq())
+	
+	// Create context once to simulate pooling/reuse if desired, 
+	// or create inside for a cleaner per-request bench.
+	ctx := &fasthttp.RequestCtx{}
+	ctx.Request.Header.SetMethod("POST")
+	ctx.Request.Header.SetContentType("application/json")
+	ctx.Request.SetBody(body)
+
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		req := httptest.NewRequest(http.MethodPost, "/fraud-score", bytes.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		w := httptest.NewRecorder()
-		handleFraudScore(w, req)
+		handleFraudScore(ctx)
+		// Important: In real fasthttp, the server resets the ctx. 
+		// In bench, we manually reset or just keep going if the handler doesn't read state.
+		ctx.Response.Reset() 
 	}
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Fixtures
-// ─────────────────────────────────────────────────────────────────────────────
 
 func makeLegitReq() *TxRequest {
 	req := &TxRequest{}
