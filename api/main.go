@@ -1,523 +1,132 @@
 package main
 
 import (
-	"compress/gzip"
 	"encoding/json"
+	"flag"
+	"fmt"
 	"log"
-	"math"
 	"net"
+	"net/http"
 	"os"
+	"os/signal"
 	"runtime"
-	"strings"
-	"sync"
+	"syscall"
 	"time"
-	"github.com/valyala/fasthttp"
 )
 
-const (
-	dims                 = 14
-	kNeighbors           = 5
-	fraudThreshold       = 0.6
-	maxAmount            = float32(10000)
-	maxInstallments      = float32(12)
-	amountVsAvgRatio     = float32(10)
-	maxMinutes           = float32(1440)
-	maxKm                = float32(1000)
-	maxTxCount24h        = float32(20)
-	maxMerchantAvgAmount = float32(10000)
-)
-
-// MCC risk table — hardcoded from mcc_risk.json, zero I/O at startup
-var mccRisk = map[string]float32{
-	"5411": 0.15,
-	"5812": 0.30,
-	"5912": 0.20,
-	"5944": 0.45,
-	"7801": 0.80,
-	"7802": 0.75,
-	"7995": 0.85,
-	"4511": 0.35,
-	"5311": 0.25,
-	"5999": 0.50,
-}
-
-// Dataset
-// Layout: refVecs[i*dims : i*dims+dims] = 14-dim float32 vector i
-//
-//	refFraud[i] == 1 means fraud
-//
-// 100k * 14 * 4 = 5.6 MB (vectors) + 100 KB (labels) = ~5.7 MB total
-// Fits entirely in L3 cache → after warmup each KNN is pure cache hits
-var (
-	refVecs  []float32
-	refFraud []uint8
-	refN     int
-
-	readyOnce sync.Once
-	readyCh   = make(chan struct{})
-
-	vecPool = sync.Pool{
-		New: func() interface{} {
-			return new([dims]float32)
-		},
-	}
-)
-
-// Precomputed responses — all 6 possible outcomes, built once at startup.
-// fraud_score ∈ {0.0, 0.2, 0.4, 0.6, 0.8, 1.0} → index by fraudCount (0-5)
-var httpResp [kNeighbors + 1][]byte
-
-func buildResponses() {
-	scoreStr := [kNeighbors + 1]string{"0.0", "0.2", "0.4", "0.6", "0.8", "1.0"}
-	for i := 0; i <= kNeighbors; i++ {
-		approved := "true"
-		if float64(i)/float64(kNeighbors) >= fraudThreshold {
-			approved = "false"
-		}
-		httpResp[i] = []byte(`{"approved":` + approved + `,"fraud_score":` + scoreStr[i] + `}`)
-	}
-}
-
-type heap5 struct {
-	dist [kNeighbors]float32
-	idx  [kNeighbors]int32
-	size int32
-	max  float32
-}
-
-func (h *heap5) push(d float32, i int32) {
-	if h.size < kNeighbors {
-		j := h.size
-		h.dist[j] = d
-		h.idx[j] = i
-		h.size++
-		if h.size == kNeighbors {
-			h.max = maxOf5(h.dist)
-		}
-		return
-	}
-	// Fast path: reject anything >= current worst (most iterations)
-	if d >= h.max {
-		return
-	}
-	// Replace the current worst element
-	worst := int32(0)
-	for j := int32(1); j < kNeighbors; j++ {
-		if h.dist[j] > h.dist[worst] {
-			worst = j
-		}
-	}
-	h.dist[worst] = d
-	h.idx[worst] = i
-	h.max = maxOf5(h.dist)
-}
-
-func maxOf5(d [kNeighbors]float32) float32 {
-	m := d[0]
-	if d[1] > m {
-		m = d[1]
-	}
-	if d[2] > m {
-		m = d[2]
-	}
-	if d[3] > m {
-		m = d[3]
-	}
-	if d[4] > m {
-		m = d[4]
-	}
-	return m
-}
-
-func (h *heap5) countFraud() int {
-	n := 0
-	for j := int32(0); j < h.size; j++ {
-		n += int(refFraud[h.idx[j]])
-	}
-	return n
-}
-
-// euclidSq returns the squared Euclidean distance between q and vecs[off:off+14].
-// Manually unrolled for 14 dimensions — the Go compiler auto-vectorizes to SSE/AVX.
-//
-//go:nosplit
-func euclidSq(q *[dims]float32, vecs []float32, off int) float32 {
-	v := vecs[off : off+dims : off+dims]
-	d0 := q[0] - v[0]
-	d1 := q[1] - v[1]
-	d2 := q[2] - v[2]
-	d3 := q[3] - v[3]
-	d4 := q[4] - v[4]
-	d5 := q[5] - v[5]
-	d6 := q[6] - v[6]
-	d7 := q[7] - v[7]
-	d8 := q[8] - v[8]
-	d9 := q[9] - v[9]
-	d10 := q[10] - v[10]
-	d11 := q[11] - v[11]
-	d12 := q[12] - v[12]
-	d13 := q[13] - v[13]
-	return d0*d0 + d1*d1 + d2*d2 + d3*d3 +
-		d4*d4 + d5*d5 + d6*d6 + d7*d7 +
-		d8*d8 + d9*d9 + d10*d10 + d11*d11 +
-		d12*d12 + d13*d13
-}
-
-// knn scans all reference vectors and returns the number of fraud labels
-// among the 5 nearest neighbors. Stack-allocated heap, zero dynamic allocations.
-func knn(query *[dims]float32) int {
-	var h heap5
-	h.max = math.MaxFloat32
-
-	vecs := refVecs
-	n := refN
-	stride := dims
-
-	// Loop unrolling: processa 4 vetores por iteração para melhor uso de cache/pipeline
-	i := 0
-	for ; i+3 < n; i += 4 {
-		d0 := euclidSq(query, vecs, i*stride)
-		d1 := euclidSq(query, vecs, (i+1)*stride)
-		d2 := euclidSq(query, vecs, (i+2)*stride)
-		d3 := euclidSq(query, vecs, (i+3)*stride)
-		h.push(d0, int32(i))
-		h.push(d1, int32(i+1))
-		h.push(d2, int32(i+2))
-		h.push(d3, int32(i+3))
-	}
-	for ; i < n; i++ {
-		h.push(euclidSq(query, vecs, i*stride), int32(i))
-	}
-	return h.countFraud()
-}
-
-// Vectorization — transforms TxRequest → [14]float32, all on the stack
-func clamp(x float32) float32 {
-	if x < 0 {
-		return 0
-	}
-	if x > 1 {
-		return 1
-	}
-	return x
-}
-
-func vectorize(req *TxRequest, out *[dims]float32) {
-	// dim 0: normalized transaction amount
-	out[0] = clamp(float32(req.Transaction.Amount) / maxAmount)
-
-	// dim 1: normalized installment count
-	out[1] = clamp(float32(req.Transaction.Installments) / maxInstallments)
-
-	// dim 2: amount relative to customer's historical average
-	if req.Customer.AvgAmount > 0 {
-		out[2] = clamp((float32(req.Transaction.Amount) / float32(req.Customer.AvgAmount)) / amountVsAvgRatio)
-	} else {
-		out[2] = 1.0
-	}
-
-	// dim 3: hour of day in UTC, normalized 0-1
-	out[3] = float32(parseHour(req.Transaction.RequestedAt)) / 23.0
-
-	// dim 4: day of week (Mon=0, Sun=6), normalized 0-1
-	out[4] = float32(parseDOW(req.Transaction.RequestedAt)) / 6.0
-
-	// dims 5-6: time & distance since last transaction (-1 sentinel if null)
-	if req.LastTransaction == nil {
-		out[5] = -1
-		out[6] = -1
-	} else {
-		mins := minutesBetween(req.LastTransaction.Timestamp, req.Transaction.RequestedAt)
-		out[5] = clamp(float32(mins) / maxMinutes)
-		out[6] = clamp(float32(req.LastTransaction.KmFromCurrent) / maxKm)
-	}
-
-	// dim 7: distance from home
-	out[7] = clamp(float32(req.Terminal.KmFromHome) / maxKm)
-
-	// dim 8: transaction count in last 24h
-	out[8] = clamp(float32(req.Customer.TxCount24h) / maxTxCount24h)
-
-	// dim 9: online transaction flag
-	if req.Terminal.IsOnline {
-		out[9] = 1
-	} else {
-		out[9] = 0
-	}
-
-	// dim 10: physical card presence
-	if req.Terminal.CardPresent {
-		out[10] = 1
-	} else {
-		out[10] = 0
-	}
-
-	// dim 11: unknown merchant (1=unknown, 0=known)
-	out[11] = 1
-	for _, m := range req.Customer.KnownMerchants {
-		if m == req.Merchant.ID {
-			out[11] = 0
-			break
-		}
-	}
-
-	// dim 12: MCC category risk score (default 0.5 for unknown MCCs)
-	if risk, ok := mccRisk[req.Merchant.MCC]; ok {
-		out[12] = risk
-	} else {
-		out[12] = 0.5
-	}
-
-	// dim 13: merchant average ticket, normalized
-	out[13] = clamp(float32(req.Merchant.AvgAmount) / maxMerchantAvgAmount)
-}
-
-// Fast ISO 8601 UTC parsing — zero allocs, no time.Parse overhead
-// Expected format: "2026-03-11T18:45:53Z"  (len >= 19)
-func atoi2(s string, i int) int {
-	return int(s[i]-'0')*10 + int(s[i+1]-'0')
-}
-
-func atoi4(s string, i int) int {
-	return int(s[i]-'0')*1000 + int(s[i+1]-'0')*100 + int(s[i+2]-'0')*10 + int(s[i+3]-'0')
-}
-
-func parseHour(ts string) int {
-	if len(ts) < 13 {
-		return 0
-	}
-	return atoi2(ts, 11)
-}
-
-// parseDOW returns day-of-week using Tomohiko Sakamoto's algorithm.
-// Output: Mon=0, Tue=1, Wed=2, Thu=3, Fri=4, Sat=5, Sun=6
-func parseDOW(ts string) int {
-	if len(ts) < 10 {
-		return 0
-	}
-	y := atoi4(ts, 0)
-	m := atoi2(ts, 5)
-	d := atoi2(ts, 8)
-	t := [12]int{0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4}
-	if m < 3 {
-		y--
-	}
-	// dow: 0=Sun … 6=Sat → remap to Mon=0 … Sun=6
-	dow := (y + y/4 - y/100 + y/400 + t[m-1] + d) % 7
-	return (dow + 6) % 7
-}
-
-// isoToUnix converts "YYYY-MM-DDThh:mm:ssZ" to Unix seconds.
-// Uses Howard Hinnant's civil_from_days algorithm — no heap allocs.
-func isoToUnix(ts string) int64 {
-	if len(ts) < 19 {
-		return 0
-	}
-	y := int64(atoi4(ts, 0))
-	mo := int64(atoi2(ts, 5))
-	d := int64(atoi2(ts, 8))
-	hh := int64(atoi2(ts, 11))
-	mm := int64(atoi2(ts, 14))
-	ss := int64(atoi2(ts, 17))
-
-	if mo <= 2 {
-		y--
-		mo += 12
-	}
-	era := y / 400
-	yoe := y - era*400
-	doy := (153*mo-457)/5 + d - 1
-	doe := yoe*365 + yoe/4 - yoe/100 + doy
-	days := era*146097 + doe - 719468
-
-	return days*86400 + hh*3600 + mm*60 + ss
-}
-
-func minutesBetween(from, to string) float64 {
-	diff := isoToUnix(to) - isoToUnix(from)
-	if diff < 0 {
-		diff = -diff
-	}
-	return float64(diff) / 60.0
-}
-
-// JSON types
-type LastTransaction struct {
-	Timestamp     string  `json:"timestamp"`
-	KmFromCurrent float64 `json:"km_from_current"`
-}
-
-type TxRequest struct {
-	ID          string `json:"id"`
-	Transaction struct {
-		Amount       float64 `json:"amount"`
-		Installments int     `json:"installments"`
-		RequestedAt  string  `json:"requested_at"`
-	} `json:"transaction"`
-	Customer struct {
-		AvgAmount      float64  `json:"avg_amount"`
-		TxCount24h     int      `json:"tx_count_24h"`
-		KnownMerchants []string `json:"known_merchants"`
-	} `json:"customer"`
-	Merchant struct {
-		ID        string  `json:"id"`
-		MCC       string  `json:"mcc"`
-		AvgAmount float64 `json:"avg_amount"`
-	} `json:"merchant"`
-	Terminal struct {
-		IsOnline    bool    `json:"is_online"`
-		CardPresent bool    `json:"card_present"`
-		KmFromHome  float64 `json:"km_from_home"`
-	} `json:"terminal"`
-	LastTransaction *LastTransaction `json:"last_transaction"`
-}
-
-func handleFraudScore(ctx *fasthttp.RequestCtx) {
-	if !ctx.IsPost() {
-			ctx.SetStatusCode(fasthttp.StatusMethodNotAllowed)
-			ctx.SetBodyString(`{"error":"method not allowed"}`)
-			return
-	}
-
-	var req TxRequest
-	if err := json.Unmarshal(ctx.PostBody(), &req); err != nil {
-			ctx.SetStatusCode(fasthttp.StatusBadRequest)
-			ctx.SetBodyString(`{"error":"bad request"}`)
-			return
-	}
-
-	vec := vecPool.Get().(*[dims]float32)
-	vectorize(&req, vec)
-	fraudCount := knn(vec)
-	vecPool.Put(vec)
-
-	ctx.SetContentType("application/json")
-	ctx.SetStatusCode(fasthttp.StatusOK)
-	ctx.SetBody(httpResp[fraudCount])
-}
-
-func handleReady(ctx *fasthttp.RequestCtx) {
-	select {
-	case <-readyCh:
-			ctx.SetStatusCode(fasthttp.StatusOK)
-			ctx.SetBodyString(`{"status":"ok"}`)
-	default:
-			ctx.SetStatusCode(fasthttp.StatusServiceUnavailable)
-			ctx.SetBodyString(`{"status":"loading"}`)
-	}
-}
-
-type refEntry struct {
-	Vector [dims]float64 `json:"vector"`
-	Label  string        `json:"label"`
-}
-
-func loadDataset(path string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	type reader interface{ Read([]byte) (int, error) }
-	var r reader = f
-
-	if len(path) >= 3 && path[len(path)-3:] == ".gz" {
-		gz, err := gzip.NewReader(f)
-		if err != nil {
-			return err
-		}
-		defer gz.Close()
-		r = gz
-	}
-
-	var entries []refEntry
-	if err := json.NewDecoder(r).Decode(&entries); err != nil {
-		return err
-	}
-
-	n := len(entries)
-	vecs := make([]float32, n*dims)
-	fraud := make([]uint8, n)
-
-	for i, e := range entries {
-		off := i * dims
-		for j := 0; j < dims; j++ {
-			vecs[off+j] = float32(e.Vector[j])
-		}
-		if e.Label == "fraud" {
-			fraud[i] = 1
-		}
-	}
-
-	var chk float32
-	for _, v := range vecs {
-		chk += v
-	}
-	log.Printf("Loaded %d reference vectors (checksum=%.4f)", n, chk)
-
-	refVecs = vecs
-	refFraud = fraud
-	refN = n
-	return nil
-}
+var ivfIndex *IVFIndex
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "health" {
-		os.Exit(0)
+	runtime.GOMAXPROCS(1)
+	modelPath := flag.String("model", "/data/model.json", "Path to XGBoost model file")
+	normPath := flag.String("normalization", "/data/normalization.json", "Path to normalization.json")
+	mccPath := flag.String("mcc-risk", "/data/mcc_risk.json", "Path to mcc_risk.json")
+	centroidsPath := flag.String("centroids", "/data/centroids.bin", "Path to IVF centroids")
+	offsetsPath := flag.String("offsets", "/data/ivf_offsets.bin", "Path to IVF offsets")
+	vectorsPath := flag.String("vectors", "/data/ivf_vectors.bin", "Path to IVF reference vectors")
+	labelsPath := flag.String("labels", "/data/ivf_labels.bin", "Path to IVF reference labels")
+	port := flag.String("port", "8080", "HTTP port")
+	flag.Parse()
+
+	// Allow env var override (useful for Docker)
+	if p := os.Getenv("PORT"); p != "" {
+		*port = p
 	}
 
-	buildResponses()
+	log.Println("Starting Rinha 2026 API...")
 
-	log.Printf("Runtime: Go %s | GOMAXPROCS=%d", runtime.Version(), runtime.GOMAXPROCS(0))
-
-	dataPath := os.Getenv("REFERENCES_PATH")
-	if dataPath == "" {
-		dataPath = "/app/resources/references.json.gz"
+	// Load normalization config
+	log.Println("Loading normalization config...")
+	normData, err := os.ReadFile(*normPath)
+	if err != nil {
+		log.Fatalf("Failed to read normalization.json: %v", err)
+	}
+	if err := json.Unmarshal(normData, &normConfig); err != nil {
+		log.Fatalf("Failed to parse normalization.json: %v", err)
 	}
 
-	if err := loadDataset(dataPath); err != nil {
-		log.Fatalf("Failed to load dataset: %v", err)
+	InvMaxInstallments = 1.0 / normConfig.MaxInstallments
+	InvMaxAmount = 1.0 / normConfig.MaxAmount
+	InvAmountVsAvgRatio = 1.0 / normConfig.AmountVsAvgRatio
+	InvMaxMinutes = 1.0 / normConfig.MaxMinutes
+	InvMaxKm = 1.0 / normConfig.MaxKm
+	InvMaxTxCount24h = 1.0 / normConfig.MaxTxCount24h
+	InvMaxMerchantAvgAmount = 1.0 / normConfig.MaxMerchantAvgAmount
+
+	// Load MCC risk map
+	log.Println("Loading MCC risk map...")
+	mccData, err := os.ReadFile(*mccPath)
+	if err != nil {
+		log.Fatalf("Failed to read mcc_risk.json: %v", err)
+	}
+	mccRiskMap = make(map[string]float64)
+	if err := json.Unmarshal(mccData, &mccRiskMap); err != nil {
+		log.Fatalf("Failed to parse mcc_risk.json: %v", err)
 	}
 
+	// Load XGBoost model
+	log.Printf("Loading XGBoost model from %s...", *modelPath)
+	predictor, err = NewPredictor(*modelPath)
+	if err != nil {
+		log.Fatalf("Failed to load model: %v", err)
+	}
+	defer predictor.Close()
 
-	readyOnce.Do(func() { close(readyCh) })
+	// Load IVF index
+	log.Printf("Loading IVF index from %s, %s, %s, %s...", *centroidsPath, *offsetsPath, *vectorsPath, *labelsPath)
+	ivfIndex, err = LoadIVFIndex(*centroidsPath, *offsetsPath, *vectorsPath, *labelsPath)
+	if err != nil {
+		log.Fatalf("Failed to load IVF index: %v", err)
+	}
 
-	port := os.Getenv("PORT")
-    if port == "" {
-        port = "9999"
-    }
+	// Mark as ready
+	ready = true
+	log.Println("Model loaded, API is ready!")
 
-    requestHandler := func(ctx *fasthttp.RequestCtx) {
-        switch string(ctx.Path()) {
-        case "/fraud-score":
-            handleFraudScore(ctx)
-        case "/ready":
-            handleReady(ctx)
-        default:
-            ctx.Error("not found", fasthttp.StatusNotFound)
-        }
-    }
+	// Pega o ID da instância pelo ENV (ex: "1", "2")
+	instanceID := os.Getenv("INSTANCE_ID")
+	if instanceID == "" {
+		instanceID = "1" // fallback
+	}
 
-    s := &fasthttp.Server{
-        Handler:               requestHandler,
-        ReadTimeout:           2 * time.Second,
-        WriteTimeout:          2 * time.Second,
-        IdleTimeout:           60 * time.Second,
-        NoDefaultServerHeader: true, // Save a few bytes/cpu cycles
-    }
+	// Define o caminho do socket no volume compartilhado
+	sockPath := fmt.Sprintf("/tmp/sockets/api%s.sock", instanceID)
 
-    if strings.HasSuffix(port, ".sock") {
-        os.Remove(port)
-        ln, err := net.Listen("unix", port)
-        if err != nil {
-            log.Fatalf("error in listen: %s", err)
-        }
-        os.Chmod(port, 0777)
-        log.Printf("Listening on socket: %s", port)
-        log.Fatal(s.Serve(ln))
-    } else {
-        log.Printf("Listening on TCP :%s", port)
-        log.Fatal(s.ListenAndServe(":" + port))
-    }
+	// IMPORTANTE: Limpa o socket antigo se o container reiniciou e o arquivo ficou lá
+	os.Remove(sockPath)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ready", readyHandler)
+	mux.HandleFunc("/fraud-score", fraudScoreHandler)
+
+	srv := &http.Server{
+		Handler:      mux,
+		ReadTimeout:  2 * time.Second,
+		WriteTimeout: 2 * time.Second,
+		IdleTimeout:  30 * time.Second,
+	}
+
+	// Cria o listener do tipo "unix"
+	listener, err := net.Listen("unix", sockPath)
+	if err != nil {
+		log.Fatalf("Failed to listen on socket: %v", err)
+	}
+
+	// Garante que o Nginx tenha permissão para ler/escrever no socket
+	os.Chmod(sockPath, 0777)
+
+	log.Printf("Listening on Unix Socket: %s", sockPath)
+
+	// Inicia o servidor no socket
+	go func() {
+		if err := srv.Serve(listener); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server failed: %v", err)
+		}
+	}()
+
+	// Limpeza graciosa ao desligar o container
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	<-stop
+	os.Remove(sockPath)
 }

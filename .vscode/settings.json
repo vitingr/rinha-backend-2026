@@ -1,0 +1,7 @@
+{
+  "go.toolsEnvVars": {
+    "CGO_ENABLED": "1",
+    "CGO_CFLAGS": "-IC:\\dev\\xgboost\\include",
+    "CGO_LDFLAGS": "-LC:\\dev\\xgboost\\lib -lxgboost"
+  }
+}

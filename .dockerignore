@@ -1,0 +1,10 @@
+.git
+index.bin
+tmp
+bin
+coverage.out
+*.exe
+*.out
+*.err
+__pycache__/
+scripts/__pycache__/
