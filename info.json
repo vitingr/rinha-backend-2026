@@ -1,7 +1,12 @@
 {
   "participants": ["Vitor Gabriel Silva"],
-  "social": ["https://github.com/vitingr", "https://www.linkedin.com/in/vitor-silva-0ab38a261/", "https://vitor-silva.com/"],
+  "social": [
+    "https://github.com/vitingr",
+    "https://www.linkedin.com/in/vitor-silva-0ab38a261/",
+    "https://vitor-silva.com/",
+    "https://www.instagram.com/vitiingr/"
+  ],
   "source-code-repo": "https://github.com/vitingr/rinha-backend-2026",
-  "stack": ["golang", "nginx"],
+  "stack": ["golang", "ivf", "xgboost", "haproxy"],
   "open_to_work": true
 }
