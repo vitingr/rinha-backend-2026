@@ -35,7 +35,7 @@ services:
     volumes:
       - sockets:/sockets
     healthcheck:
-      test: [ "CMD-SHELL", "sleep 300 && exit 0" ]
+      test: [ "CMD-SHELL", "sleep 1 && exit 0" ]
       interval: 5s
       timeout: 302s
       retries: 1
@@ -55,7 +55,7 @@ services:
     volumes:
       - sockets:/sockets
     healthcheck:
-      test: [ "CMD-SHELL", "sleep 300 && exit 0" ]
+      test: [ "CMD-SHELL", "sleep 1 && exit 0" ]
       interval: 5s
       timeout: 302s
       retries: 1
