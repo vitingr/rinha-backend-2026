@@ -13,7 +13,7 @@ services:
       - "9999:9999"
     volumes:
       - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
-      - sockets:/sockets
+      - sockets:/tmp/sockets
     depends_on:
       api1:
         condition: service_healthy
@@ -33,7 +33,7 @@ services:
       - PORT=8080
       - INSTANCE_ID=1
     volumes:
-      - sockets:/sockets
+      - sockets:/tmp/sockets
     healthcheck:
       test: [ "CMD-SHELL", "sleep 5 && exit 0" ]
       interval: 5s
@@ -53,7 +53,7 @@ services:
       - PORT=8080
       - INSTANCE_ID=2
     volumes:
-      - sockets:/sockets
+      - sockets:/tmp/sockets
     healthcheck:
       test: [ "CMD-SHELL", "sleep 5 && exit 0" ]
       interval: 5s
