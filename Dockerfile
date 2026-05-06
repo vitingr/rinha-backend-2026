@@ -41,5 +41,7 @@ COPY training/output/ivf_offsets.bin /data/ivf_offsets.bin
 COPY training/output/ivf_vectors.bin /data/ivf_vectors.bin
 COPY training/output/ivf_labels.bin /data/ivf_labels.bin
 
+RUN mkdir -p /sockets
+
 EXPOSE 8080
 CMD ["/server", "--model", "/data/model.json", "--port", "8080"]
