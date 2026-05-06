@@ -90,7 +90,7 @@ func main() {
 	}
 
 	// Define o caminho do socket no volume compartilhado
-	sockPath := fmt.Sprintf("/tmp/sockets/api%s.sock", instanceID)
+	sockPath := fmt.Sprintf("/sockets/api%s.sock", instanceID)
 
 	// IMPORTANTE: Limpa o socket antigo se o container reiniciou e o arquivo ficou lá
 	os.Remove(sockPath)
