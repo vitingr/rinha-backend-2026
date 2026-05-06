@@ -35,10 +35,11 @@ services:
     volumes:
       - sockets:/tmp/sockets
     healthcheck:
-      test: [ "CMD-SHELL", "sleep 5 && exit 0" ]
+      test: ["CMD-SHELL", "test -S /tmp/sockets/api1.sock"]
       interval: 5s
-      timeout: 10s
-      retries: 1
+      timeout: 5s
+      retries: 15
+      start_period: 10s
     networks:
       - rinha
     deploy:
@@ -55,10 +56,11 @@ services:
     volumes:
       - sockets:/tmp/sockets
     healthcheck:
-      test: [ "CMD-SHELL", "sleep 5 && exit 0" ]
+      test: ["CMD-SHELL", "test -S /tmp/sockets/api1.sock"]
       interval: 5s
-      timeout: 10s
-      retries: 1
+      timeout: 5s
+      retries: 15
+      start_period: 10s
     networks:
       - rinha
     deploy:
