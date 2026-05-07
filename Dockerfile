@@ -20,7 +20,7 @@ RUN CGO_ENABLED=1 go build -o /server -ldflags="-s -w" .
 # ============================================================
 # Stage 2: Runtime image
 # ============================================================
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim AS prod
 
 # Install XGBoost runtime library
 RUN apt-get update && apt-get install -y --no-install-recommends \
