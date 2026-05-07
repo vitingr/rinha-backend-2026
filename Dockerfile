@@ -5,11 +5,11 @@ FROM golang:1.25.5-bookworm AS builder
 
 # Install XGBoost development headers
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libxgboost-dev \
-    && rm -rf /var/lib/apt/lists/*
+  libxgboost-dev \
+  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY api/go.mod api/go.sum ./
+COPY api/go.mod ./
 RUN go mod download
 
 COPY api/*.go .
@@ -24,10 +24,10 @@ FROM debian:bookworm-slim AS prod
 
 # Install XGBoost runtime library
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libxgboost0 \
-    ca-certificates \
-    wget \
-    && rm -rf /var/lib/apt/lists/*
+  libxgboost0 \
+  ca-certificates \
+  wget \
+  && rm -rf /var/lib/apt/lists/*
 
 # Copy Go binary
 COPY --from=builder /server /server
