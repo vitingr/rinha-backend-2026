@@ -1,0 +1,65 @@
+name: Build and Publish Docker Image
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  tag:
+    name: Tag Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: go-semantic-release/action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-and-push-docker-image:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    needs: tag
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Enables CPU architecture emulation required for multi-platform Docker builds.
+      # Necessary when publishing Go images for non-native targets such as linux/arm64
+      # from GitHub Actions amd64 runners, especially for CGO/native dependencies.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.RINHA_BACKEND_2026_GITHUB_TOKEN }}
+
+      - name: Fetch latest tag
+        id: get_tag
+        run: |
+          git fetch --tags
+          TAG=$(git describe --tags --abbrev=0)
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Build and push Docker images
+        uses: docker/build-push-action@v5.1.0
+        with:
+          context: .
+          push: true
+          file: ./Dockerfile
+          target: prod
+          platforms: linux/amd64
+          tags: |
+            ghcr.io/vitingr/rinha-backend-2026-go:${{ steps.get_tag.outputs.tag }}
+            ghcr.io/vitingr/rinha-backend-2026-go:latest

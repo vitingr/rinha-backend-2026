@@ -1,2 +1,10 @@
-sockets/
+# sockets
+tmp/sockets/
 *.sock
+
+# test results
+test/result.json
+test/results.json
+
+# venv
+training/.venv/Lib

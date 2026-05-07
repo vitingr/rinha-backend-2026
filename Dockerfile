@@ -41,6 +41,7 @@ COPY training/output/ivf_offsets.bin /data/ivf_offsets.bin
 COPY training/output/ivf_vectors.bin /data/ivf_vectors.bin
 COPY training/output/ivf_labels.bin /data/ivf_labels.bin
 
+# Create temporary directory for sockets
 RUN mkdir -p /tmp/sockets && chmod 777 /tmp/sockets
 
 EXPOSE 8080

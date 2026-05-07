@@ -1,0 +1,1 @@
+docker run --rm -i --network="vitingr-rinha-backend-2026" -v ${PWD}/test:/scripts -w /scripts grafana/k6 run test.js
