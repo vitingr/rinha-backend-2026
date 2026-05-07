@@ -63,18 +63,17 @@ def main():
 	for cell_id, indices in enumerate(cell_indices):
 		ivf_offsets[cell_id] = current_idx
 		for idx in indices:
-			# Quantize and store vector
 			v = vectors[idx]
 			for j in range(dim):
-				ivf_vectors[current_idx, j] = quantize(v[j])
-						
-				# Pack label
-				if labels[idx] == 1:
+					ivf_vectors[current_idx, j] = quantize(v[j])
+			
+			# Pack label
+			if labels[idx] == 1:
 					byte_idx = current_idx // 8
 					bit_idx = current_idx % 8
 					ivf_labels_bits[byte_idx] |= (1 << bit_idx)
-						
-				current_idx += 1
+			
+			current_idx += 1
 		
 		ivf_offsets[args.nlist] = n
 
