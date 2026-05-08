@@ -124,7 +124,6 @@ func main() {
 		}
 	}()
 
-	// Limpeza graciosa ao desligar o container
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	<-stop

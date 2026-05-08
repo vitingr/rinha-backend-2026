@@ -65,7 +65,7 @@ def main():
 		for idx in indices:
 			v = vectors[idx]
 			for j in range(dim):
-					ivf_vectors[current_idx, j] = quantize(v[j])
+				ivf_vectors[current_idx, j] = quantize(v[j])
 			
 			# Pack label
 			if labels[idx] == 1:
@@ -75,7 +75,7 @@ def main():
 			
 			current_idx += 1
 		
-		ivf_offsets[args.nlist] = n
+	ivf_offsets[args.nlist] = n
 
 	# 4. Save files
 	os.makedirs(args.output_dir, exist_ok=True)

@@ -65,10 +65,10 @@ def compute_knn_scores(vectors: np.ndarray, labels: np.ndarray, k: int = 5, batc
 	n_threads = os.cpu_count() or 8
 	faiss.omp_set_num_threads(n_threads)
 	# IVFFlat: partition vectors into nlist cells, then search nprobe cells per query.
-	# nlist=1024, nprobe=32: searches ~3% of cells → ~30x faster than brute force.
+	# nlist=1024, nprobe=64: searches ~3% of cells → ~30x faster than brute force.
 	# For training labels, ~99% recall is more than sufficient.
 	nlist = 1024
-	nprobe = 32
+	nprobe = 64
 
 	print(f"[2/5] Building FAISS IVF index ({n} vectors, {dim} dims, {n_threads} threads, nlist={nlist})...")
 	t0 = time.time()
